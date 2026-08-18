@@ -29,6 +29,9 @@ func testAccPreCheck(t *testing.T) {
 }
 
 func TestAccSSMSendCommandAction_basic(t *testing.T) {
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("Set TF_ACC to run acceptance tests")
+	}
 	instanceID := os.Getenv("TEST_INSTANCE_ID")
 	region := os.Getenv("TEST_AWS_REGION")
 
