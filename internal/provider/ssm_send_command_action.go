@@ -16,6 +16,7 @@ import (
 	actionschema "github.com/hashicorp/terraform-plugin-framework/action/schema"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 )
 
 const ssmPollInterval = 5 * time.Second
@@ -35,7 +36,8 @@ type ssmSendCommandActionModel struct {
 	Commands         types.List   `tfsdk:"commands"`
 	WorkingDirectory types.String `tfsdk:"working_directory"`
 	Region           types.String `tfsdk:"region"`
-	WaitSeconds      types.Int64  `tfsdk:"wait_seconds"`
+	WaitSeconds      types.Int64  `tfsdk:"wait"`
+	Timeout          types.Int64  `tfsdk:"timeout"`
 }
 
 func (a *ssmSendCommandAction) Metadata(_ context.Context, _ action.MetadataRequest, resp *action.MetadataResponse) {
@@ -69,9 +71,18 @@ func (a *ssmSendCommandAction) Schema(_ context.Context, _ action.SchemaRequest,
 				MarkdownDescription: "AWS region override (e.g. `us-east-1`). " +
 					"Defaults to the region resolved by the AWS SDK default credential chain.",
 			},
-			"wait_seconds": actionschema.Int64Attribute{
+			"wait": actionschema.Int64Attribute{
+				Optional: true,
+				MarkdownDescription: "Maximum seconds to wait for the instance to register with SSM before dispatching the command. " +
+					"The action polls `DescribeInstanceInformation` with exponential backoff (2s→30s) until the instance appears as `Online`. " +
+					"If omitted, the command is dispatched immediately without any registration check.",
+				Validators: []validator.Int64{
+					int64validator.AtLeast(1),
+				},
+			},
+			"timeout": actionschema.Int64Attribute{
 				Optional:            true,
-				MarkdownDescription: "Maximum seconds to wait for the command to complete. Defaults to `120` if not set.",
+				MarkdownDescription: "Maximum seconds to wait for the command to complete after it has been dispatched. Defaults to `120` if not set.",
 				Validators: []validator.Int64{
 					int64validator.AtLeast(1),
 				},
@@ -85,12 +96,6 @@ func (a *ssmSendCommandAction) Invoke(ctx context.Context, req action.InvokeRequ
 	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
 	if resp.Diagnostics.HasError() {
 		return
-	}
-
-	// Apply default wait.
-	waitSec := int64(120)
-	if !data.WaitSeconds.IsNull() && !data.WaitSeconds.IsUnknown() {
-		waitSec = data.WaitSeconds.ValueInt64()
 	}
 
 	// Build AWS config - optional region override.
@@ -109,8 +114,63 @@ func (a *ssmSendCommandAction) Invoke(ctx context.Context, req action.InvokeRequ
 	}
 
 	client := ssm.NewFromConfig(awsCfg)
-
 	instanceID := data.InstanceID.ValueString()
+
+	// Poll with exponential backoff until the instance is registered and online
+	// with SSM before dispatching the command.
+	if !data.WaitSeconds.IsNull() && !data.WaitSeconds.IsUnknown() {
+		regTimeout := time.Duration(data.WaitSeconds.ValueInt64()) * time.Second
+		resp.SendProgress(action.InvokeProgressEvent{
+			Message: fmt.Sprintf("Waiting up to %s for instance %q to register with SSM...", regTimeout, instanceID),
+		})
+
+		regCtx, regCancel := context.WithTimeout(ctx, regTimeout)
+		defer regCancel()
+
+		waiter := &retry.StateChangeConf{
+			Pending:      []string{"pending"},
+			Target:       []string{"online"},
+			Delay:        2 * time.Second,
+			MinTimeout:   2 * time.Second,
+			PollInterval: 0, // 0 enables exponential backoff
+			Timeout:      regTimeout,
+			Refresh: func() (any, string, error) {
+				out, err := client.DescribeInstanceInformation(regCtx, &ssm.DescribeInstanceInformationInput{
+					Filters: []ssmtypes.InstanceInformationStringFilter{
+						{Key: aws.String("InstanceIds"), Values: []string{instanceID}},
+					},
+				})
+				if err != nil {
+					return nil, "pending", nil //nolint:nilerr // transient; keep polling
+				}
+				for _, info := range out.InstanceInformationList {
+					if aws.ToString(info.InstanceId) == instanceID &&
+						info.PingStatus == ssmtypes.PingStatusOnline {
+						return info, "online", nil
+					}
+				}
+				return nil, "pending", nil
+			},
+		}
+
+		if _, err := waiter.WaitForStateContext(regCtx); err != nil {
+			resp.Diagnostics.AddError(
+				"Instance did not register with SSM in time",
+				fmt.Sprintf("Instance %q did not appear as Online in SSM within %s: %v", instanceID, regTimeout, err),
+			)
+			return
+		}
+
+		resp.SendProgress(action.InvokeProgressEvent{
+			Message: fmt.Sprintf("Instance %q is registered with SSM. Dispatching command...", instanceID),
+		})
+	}
+
+	// Apply command completion timeout.
+	timeoutSec := int64(120)
+	if !data.Timeout.IsNull() && !data.Timeout.IsUnknown() {
+		timeoutSec = data.Timeout.ValueInt64()
+	}
 
 	// Convert types.List -> []string.
 	var commands []string
@@ -152,11 +212,11 @@ func (a *ssmSendCommandAction) Invoke(ctx context.Context, req action.InvokeRequ
 	}
 	commandID := aws.ToString(sendOut.Command.CommandId)
 	resp.SendProgress(action.InvokeProgressEvent{
-		Message: fmt.Sprintf("Command %q dispatched. Polling for completion (up to %ds)...", commandID, waitSec),
+		Message: fmt.Sprintf("Command %q dispatched. Polling for completion (up to %ds)...", commandID, timeoutSec),
 	})
 
 	// Poll until the command finishes or the deadline is reached.
-	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(waitSec)*time.Second)
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
 	ticker := time.NewTicker(ssmPollInterval)
@@ -168,7 +228,7 @@ func (a *ssmSendCommandAction) Invoke(ctx context.Context, req action.InvokeRequ
 			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
 				resp.Diagnostics.AddError(
 					"SSM command timed out",
-					fmt.Sprintf("Command %q did not complete within %d seconds.", commandID, waitSec),
+					fmt.Sprintf("Command %q did not complete within %d seconds.", commandID, timeoutSec),
 				)
 			} else {
 				resp.Diagnostics.AddError(

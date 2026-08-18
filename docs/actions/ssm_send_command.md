@@ -23,5 +23,6 @@ Sends an AWS SSM Run Command to the target instance specified by `instance_id`, 
 ### Optional
 
 - `region` (String) AWS region override (e.g. `us-east-1`). Defaults to the region resolved by the AWS SDK default credential chain.
-- `wait_seconds` (Number) Maximum seconds to wait for the command to complete. Defaults to `120` if not set.
+- `timeout` (Number) Maximum seconds to wait for the command to complete after it has been dispatched. Defaults to `120` if not set.
+- `wait` (Number) Maximum seconds to wait for the instance to register with SSM before dispatching the command. The action polls `DescribeInstanceInformation` with exponential backoff (2s→30s) until the instance appears as `Online`. If omitted, the command is dispatched immediately without any registration check.
 - `working_directory` (String) Working directory on the target instance from which all commands are executed. Passed as the SSM `workingDirectory` parameter.
