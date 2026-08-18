@@ -37,7 +37,8 @@ Sends an AWS SSM Run Command to a target EC2 instance and waits for it to comple
 | `commands` | List of String | Yes | Ordered list of shell commands to run |
 | `working_directory` | String | No | Working directory on the target instance |
 | `region` | String | No | AWS region override. Defaults to the SDK credential chain region |
-| `wait_seconds` | Number | No | Max seconds to wait for completion. Defaults to `120` |
+| `wait` | Number | No | Max seconds to poll SSM with exponential backoff until the instance is `Online`. If omitted, the command is dispatched immediately |
+| `timeout` | Number | No | Max seconds to wait for the command to complete after dispatch. Defaults to `120` |
 
 #### Example
 
@@ -52,7 +53,8 @@ action "utils_ssm_send_command" "deploy" {
     instance_id       = aws_instance.app.id
     region            = "us-east-1"
     working_directory = "/home/ec2-user"
-    wait_seconds      = 60
+    wait              = 120  # poll SSM with exponential backoff until the instance is Online
+    timeout           = 300  # max seconds for the commands to complete after dispatch
 
     commands = [
       "echo 'Starting deployment'",

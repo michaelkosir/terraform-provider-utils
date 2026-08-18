@@ -30,7 +30,8 @@ action "utils_ssm_send_command" "deploy" {
     instance_id       = aws_instance.app.id
     region            = "us-east-1"
     working_directory = "/home/ec2-user"
-    wait_seconds      = 60
+    wait              = 120 # poll SSM with exponential backoff until the instance is Online
+    timeout           = 300 # max seconds for the commands to complete after dispatch
 
     commands = [
       "echo 'Starting deployment'",
